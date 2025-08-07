@@ -1,0 +1,354 @@
+---
+title: "PM & Torsion - Code Supplement"
+author: "Nidhal Bouchahda, Fabian Scheipl"
+date: "`r Sys.Date()`"
+output: 
+  html_document: 
+     self_contained: yes
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache  = TRUE)
+```
+
+## Requirements
+
+```{r}
+library(tidyverse)
+library(readr)
+library(tf)
+library(tidyfun)
+library(ggplot2)
+library(refund)
+library(mgcViz)
+library(rgl)
+library(plotly)
+library(fdaoutlier)
+library(purrr)
+library(patchwork)
+library(table1)
+
+sessionInfo()
+```
+
+```{r}
+strain_df<-readRDS("papillary muscle_data.rds")
+strain_df$id<-factor(strain_df$id)
+scalar_covariates<-readRDS("scalar_covariates.rds")
+scalar_covariates$id<-factor(scalar_covariates$id)
+```
+
+```{r}
+# put irregular functions x that vary in length/start/end on a new_domain
+# on a regular grid of length n_arg
+tf_rectify <- function(x, new_domain = c(0, 1), n_arg = 30, ...) {
+  x_val <- tf_evaluations(x)
+  x_arg <- tf_arg(x) |> ensure_list()
+  # create new grids with same proportional spacings as old grids on the new domain:
+  new_arg_irreg <- purrr::map(x_arg, 
+                        function(x) (((x - min(x))/diff(range(x))) * # scale to [0,1]
+                                        diff(new_domain)) +  # scale to [0, new_length]
+                                       new_domain[1]) # push to new domain
+  new_arg_grid <- seq(new_domain[1], new_domain[2], length = n_arg)
+  # put data on new common domain and re-eval on new grid
+  tfd(x_val, new_arg_irreg, ...) |> tfd(arg = new_arg_grid, ...) 
+}
+```
+
+## Descriptives / Data Viz / Data Prep
+
+```{r, fig.height = 18}
+# get regular evenly spaced time points for the curves
+strain_df_clean <- strain_df %>%
+  mutate(
+    strain_str = ifelse(strain_curve %in% c("GLS4", "GLS2", "GLS3"), "GLS",
+                        ifelse(strain_curve %in% c("LA4", "LA2"), "LA", strain_curve)
+    ),
+    strain_reg = tfd(strain_val[, seq(0, 1, length.out = 60), interpolate = TRUE]),
+    id = factor(id)
+  )
+
+# show complete dataset before aggregation:
+ggplot(strain_df_clean) +
+  geom_spaghetti(aes(y = strain_reg, color = strain_str, linetype = cycle_number)) +
+  facet_wrap(~id) + labs(title = "Full Dataset")
+```
+
+```{r}
+# global mean strain curves
+strain_df_clean |>
+  group_by(strain_str) %>%
+  summarize(
+    strain_mean = mean(strain_reg),
+    strain_se = sd(strain_reg) / sqrt(nlevels(id))
+  ) %>%
+  filter(strain_str %in% c("APM", "PPM", "TOR", "LA", "GLS")) %>%
+  ggplot() +
+  geom_spaghetti(aes(y = strain_mean, color = strain_str)) +
+  geom_errorband(aes(
+    ymin = strain_mean - 2 * strain_se,
+    ymax = strain_mean + 2 * strain_se,
+    fill = strain_str
+  )) + labs(title = "Global Mean Strain Curves")
+```
+
+
+```{r, fig.height = 18}
+# average curves per patient: gls=mean(gls2,gls3, gls4), LA=mean (LA2, LA4)
+strain_df_patientwise <- strain_df_clean %>%
+  group_by(id, strain_str) %>%
+  summarise(
+    strain_m = mean(strain_reg)
+  )
+
+ggplot(strain_df_patientwise) +
+  geom_spaghetti(aes(y = strain_m, color = strain_str)) +
+  facet_wrap(~id) + labs(title = "Patient-wise Mean Strain Curves")
+```
+
+
+```{r}
+# putting in right format for analysis and  adding the scalar covariates of interest
+strain_df_patientwise_long <- strain_df_patientwise %>%
+  dplyr::select(c("id", "strain_str", "strain_m")) %>%
+  pivot_wider(names_from = strain_str, values_from = strain_m)
+
+strain_df_patientwise_long <- strain_df_patientwise_long[-43, ]
+
+strain_df_patientwise_long <- left_join(strain_df_patientwise_long, scalar_covariates, by = "id") #
+```
+
+```{r}
+strain_analysisdata <- strain_df_patientwise_long
+```
+
+### Table 1
+
+```{r}
+strain_analysisdata_summaries <- strain_analysisdata %>% 
+    mutate(
+      tor_max_time = TOR|>tf_where(value == max(value), "first"),
+         tor_max = TOR|>tf_fmax(),
+         apm_min_time = APM|>tf_where(value == min(value), "first"),
+         apm_min = APM|>tf_fmin(),
+         ppm_min_time=PPM|>tf_where(value == min(value), "first"),
+         ppm_min=PPM|>tf_fmin(),
+         gls_min_time=GLS|>tf_where(value == min(value), "first"),
+         gls_min=GLS |> tf_fmin())
+
+table1(~ 
+         Age + factor(Gender) + factor(HTN) + factor(DIABETES) + weight + height + 
+         heart_rate + tor_max + tor_max_time + gls_min + gls_min_time + 
+         apm_min + apm_min_time + ppm_min + ppm_min_time,
+       data = strain_analysisdata_summaries)
+```
+
+
+```{r}
+m3_data <- strain_analysisdata %>%
+  select(id, APM, PPM, TOR, Age, Gender, heart_rate)
+
+# plotting the apm, ppm and torsion curves
+f_summary <- m3_data %>%
+  dplyr::select("id", "APM", "PPM", "TOR") %>%
+  pivot_longer(!id, names_to = "Curve", values_to = "strain") %>%
+  group_by(Curve) %>%
+  summarise(
+    strain_mean = mean(strain),
+    strain_sd = sd(strain)
+  ) %>%
+  mutate(
+    maximum = strain_mean |> tf_where(value == max(value), "first"),
+    minimum = strain_mean |> tf_where(value == min(value), "first")
+  )
+
+
+f_summary %>%
+  ggplot() +
+  geom_spaghetti(aes(y = strain_mean, color = Curve)) +
+  geom_errorband(aes(
+    ymax = strain_mean + 2 * strain_sd / sqrt(nrow(m3_data)),
+    ymin = strain_mean - 2 * strain_sd / sqrt(nrow(m3_data)),
+    fill = Curve
+  )) +
+  geom_vline(xintercept = 0.41, color = "blue", linetype = 2) + # time of maximum torsion
+  geom_vline(xintercept = 0.50, linetype = 2) + # time of minimum PM (ie.maximum contraction)
+  labs(
+    x = "Cardiac cycle proportion",
+    y = "",
+    caption = "mean+/-2 standard errors",
+    legend = "Curve"
+  ) +
+  theme_bw()
+```
+
+
+### Peak Timing Difference Analysis 
+
+```{r}
+# comparing time of maximum PM contraction to time of maximum torsion occurrence
+APM_min<-m3_data$APM |> tf_where(value == min(value), "first")
+PPM_min<-   m3_data$PPM |> tf_where(value == min(value), "first")
+Tor_max<-m3_data$TOR |> tf_where(value == max(value), "first")
+
+mean(c(APM_min,PPM_min))
+mean(APM_min)
+sd(APM_min)
+mean(PPM_min)
+sd(PPM_min)
+mean(Tor_max)
+sd(Tor_max)
+
+
+(res1 <- t.test(APM_min, Tor_max, paired = TRUE))
+(res2 <- t.test(PPM_min, Tor_max, paired = TRUE))
+(res3 <- t.test(PPM_min, APM_min, paired = TRUE))
+
+
+# min apm/ppm ( maximum of papillary muscles contraction) occurs significantly  later than maximum torsion 
+
+# association across patients:
+layout(t(1:2))
+plot(APM_min, Tor_max, asp = 1, col = rgb(0,0,0,.3)); abline(c(0,1), col = "gold") 
+plot(PPM_min, Tor_max, asp = 1, col = rgb(0,0,0,.3)); abline(c(0,1), col = "gold")
+
+layout(t(1:2))
+plot(APM_min, Tor_max - APM_min, asp = 1, col = rgb(0,0,0,.3)); abline(c(0,0), col = "gold") 
+plot(PPM_min, Tor_max - PPM_min, asp = 1, col = rgb(0,0,0,.3)); abline(c(0,0), col = "gold")
+# patients with later APM_min (PPM_min as well to lesser extent) tend to have larger delay between Tor_max and APM_min
+```
+
+
+```{r}
+# selecting only diastolic curve value, diastole begins at the maximum of torsion
+m4_data <- strain_analysisdata %>%
+  select(id, TOR, APM, PPM, Gender, Age, heart_rate) %>%
+  mutate(tor_max = TOR |> tf_where(value == max(value), "first")) %>%
+  mutate(
+    tor_diastole = TOR |> tf_zoom(tor_max, 1),
+    apm_diastole = APM |> tf_zoom(tor_max, 1),
+    ppm_diastole = PPM |> tf_zoom(tor_max, 1)
+  )
+
+m4_data$heart_rate[is.na(m4_data$heart_rate)] <- 
+  mean(m4_data$heart_rate, na.rm = TRUE) # imputing the mean for one missing heart rate observation
+
+# obtaining regular and same domain over diastole torsion curves
+m4_data <- mutate(m4_data,
+  tor_diast = tf_rectify(tor_diastole),
+  apm_diast = tf_rectify(apm_diastole),
+  ppm_diast = tf_rectify(ppm_diastole)
+)
+
+m4_data %>% ggplot() +
+  geom_spaghetti(aes(y = tor_diast)) +
+  labs(title = "Rectified diastole curves") +
+m4_data %>% ggplot() +
+  geom_spaghetti(aes(y = apm_diast)) +
+m4_data %>% ggplot() +
+  geom_spaghetti(aes(y = ppm_diast)) 
+```
+
+## Models
+
+
+```{r}
+# data prep for pffr
+m4_data$tor_d_mat <- m4_data$tor_diast |> as.matrix()
+m4_data$apm_d <- with(m4_data, apm_diast - mean(apm_diast)) |> as.matrix()
+m4_data$ppm_d <- with(m4_data, ppm_diast - mean(ppm_diast)) |> as.matrix()
+```
+
+
+```{r}
+# diastolic concurrent fof regression
+m4 <- pffr(tor_d_mat ~ s(apm_d) + s(ppm_d) + Gender + Age + heart_rate,
+  yind = seq(0, 1, length.out = 30),
+  family = "gaulss", data = m4_data
+)
+```
+
+
+```{r}
+summary(m4)
+pffr.check(m4, rep = 100)
+
+m4_gam <- m4
+class(m4_gam) <- class(m4)[-1]
+
+e <- getViz(m4_gam)
+
+qq.gamViz(e, level = .9, CI = "quantile")
+
+matrix(residuals(m4, reformat = FALSE), nrow = m4$pffr$nobs, byrow = T) |>
+  cov() |>
+  filled.contour()
+plotly::plot_ly(
+  z = ~ cov(matrix(residuals(m4, reformat = FALSE), nrow = m4$pffr$nobs, byrow = T)),
+  type = "surface",
+  colorscale = "Viridis", # Color scheme - you can change this
+  showscale = TRUE # Show color scale legend
+)
+matrix(residuals(m4, reformat = FALSE), nrow = m4$pffr$nobs, byrow = T) |>
+  cor() |>
+  filled.contour()
+
+plotly::plot_ly(
+  z = ~ cor(matrix(residuals(m4, reformat = FALSE), nrow = m4$pffr$nobs, byrow = T)),
+  type = "surface",
+  colorscale = "Viridis", # Color scheme - you can change this
+  showscale = TRUE # Show color scale legend
+)
+```
+
+
+```{r}
+# changed color scheme here so we can easier distinguish between
+# time-value regions with no significant association to TOR (white) and
+# small-effect-but-still-statistically-significant regions (grey-ish hues)
+plot(sm(e, 2)) +
+  l_fitRaster(pTrans = function(.p) .p < 0.05) +
+  scale_fill_gradient2(low = "blue", mid = "lightgrey", high = "red") +
+  l_fitContour(bins = 20) + labs(y = "Diastole proportion", x = "APM", title = "") +
+  guides(fill = guide_legend(title = "Effect on untwist"))
+
+plot(m4, scheme = 1, select = 2, ticktype = "detailed")
+
+plot(sm(e, 3)) +
+  l_fitRaster(pTrans = function(.p) .p < 0.05) +
+  scale_fill_gradient2(low = "blue", mid = "lightgrey", high = "red") +
+  l_fitContour(bins = 20) + labs(y = "Diastole proportion", x = "PPM", title = "") +
+  guides(fill = guide_legend(title = "Effect on untwist"))
+
+
+plot(m4, scheme = 1, select = 3, ticktype = "detailed")
+```
+
+
+```{r}
+diastole_summary <- m4_data %>%
+  pivot_longer(cols = 12:14, names_to = "Curve", values_to = "strain") %>%
+  group_by(Curve) %>%
+  summarise(
+    strain_mean = mean(strain),
+    strain_sd = sd(strain)
+  )
+
+diastole_summary %>% ggplot() +
+  geom_spaghetti(aes(y = strain_mean, color = Curve)) +
+  geom_errorband(aes(
+    ymax = strain_mean + 2 * strain_sd / sqrt(nrow(m4_data)),
+    ymin = strain_mean - 2 * strain_sd / sqrt(nrow(m4_data)),
+    fill = Curve
+  )) +
+  labs(
+    x = "Diastole proportion",
+    y = "",
+    caption = "mean+/-2 standard errors",
+    legend = "Curve"
+  ) +
+  theme_bw()
+```
+
+
